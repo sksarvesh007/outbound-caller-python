@@ -1,3 +1,5 @@
 .env.local
-venv/
-.DS_Store
+venv
+.venv
+.idea
+.github
