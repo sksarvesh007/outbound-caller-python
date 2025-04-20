@@ -212,12 +212,7 @@ async def entrypoint(ctx: JobContext):
         "customer_phone_number": phone_number,
         "created_at": call_start_time,
         "updated_at": call_start_time,
-        "messages": [],
-        "user_id": None,
-        "productID": None,
-        "user_full_name": "",
-        "user_email": "",
-        "recording_url": f"https://storage.example.com/{call_id}-recording.mp3"
+        "messages": []
     }
 
     # Insert initial call data
@@ -382,28 +377,24 @@ async def entrypoint(ctx: JobContext):
             if calls_collection is not None and call_id:
                 call_end_time = datetime.now(timezone.utc).isoformat()
                 
-                # Calculate call duration in seconds
-                start_time = datetime.fromisoformat(call_start_time.replace('Z', '+00:00'))
-                end_time = datetime.now(timezone.utc)
-                call_duration = (end_time - start_time).total_seconds()
-                
-                # Create a basic summary
-                summary = f"AI agent made a call to {phone_number}. The call lasted {call_duration:.2f} seconds."
-                
                 # Build full transcript text from messages
                 transcript_text = ""
                 for msg in conversation["messages"]:
                     transcript_text += f"{msg['speaker']}: {msg['content']}\n"
                 
+                # Calculate call duration in seconds
+                start_time = datetime.fromisoformat(call_start_time.replace('Z', '+00:00'))
+                end_time = datetime.now(timezone.utc)
+                call_duration = (end_time - start_time).total_seconds()
+                
                 update_data = {
                     "$set": {
                         "status": "ended",
                         "ended_at": call_end_time,
-                        "transcript": transcript_text,
+                        "transcript": transcript_text[:1000],  # Truncate if needed
                         "messages": messages_list,
                         "call_duration": call_duration,
-                        "ended_reason": "normal-completion",
-                        "summary": summary,
+                        "ended_reason": "completed",
                         "updated_at": call_end_time
                     }
                 }
@@ -549,7 +540,7 @@ class CallActions(llm.FunctionContext):
                 "$set": {
                     "status": "ended",
                     "ended_at": call_end_time,
-                    "ended_reason": "voicemail-detected",
+                    "ended_reason": "voicemail",
                     "summary": "Call reached voicemail",
                     "updated_at": call_end_time
                 }
