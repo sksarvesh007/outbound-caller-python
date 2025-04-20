@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 import logging  
 from dotenv import load_dotenv
 import json
 import os
+import aiofiles
 from time import perf_counter
-from typing import Annotated
+from typing import Annotated, Dict, Any, Optional
+import uuid
 from livekit import rtc, api
 from livekit.agents import (
     AutoSubscribe,
@@ -23,12 +25,37 @@ from livekit.agents.pipeline import VoicePipelineAgent
 from livekit.agents import metrics
 
 from livekit.plugins import deepgram, openai, silero, elevenlabs, google
+from pymongo import MongoClient
 
+#stop the pymongo logging 
+logging.getLogger("pymongo").setLevel(logging.WARNING)
 
 # load environment variables, this is optional, only used for local development
 load_dotenv(dotenv_path=".env.local")
 logger = logging.getLogger("outbound-caller")
 logger.setLevel(logging.INFO)
+
+# MongoDB connection setup
+MONGO_URI = os.getenv("MONGODB_URI")
+MONGO_USERNAME = os.getenv("MONGODB_USERNAME")
+MONGO_PASSWORD = os.getenv("MONGODB_PASSWORD")
+mongodb_client = None
+db = None
+calls_collection = None
+
+if MONGO_URI and MONGO_USERNAME and MONGO_PASSWORD:
+    mongo_connection_string = MONGO_URI.replace(
+        "<username>", MONGO_USERNAME).replace("<password>", MONGO_PASSWORD
+    )
+    try:
+        mongodb_client = MongoClient(mongo_connection_string)
+        db = mongodb_client["outbound_calls"]
+        calls_collection = db["calls"]
+        print("MongoDB connection established")
+    except Exception as e:
+        print(f"Error connecting to MongoDB: {e}")
+else:
+    print("MongoDB credentials not found in environment variables")
 
 outbound_trunk_id = os.getenv("SIP_OUTBOUND_TRUNK_ID")
 _default_instructions = (f"""
@@ -52,7 +79,7 @@ Make cold calls for Perfect Sprout's AI Prospecting services, turn resistance in
 
 1. **Verification and Opening**
 - **Verify**: Confirm speaking with correct person. Wait for confirmation before proceeding.
-- **Permission with Pattern Interrupt**: Ask permission to explain call purpose. Wait for permission before proceeding. (Example: “Hey Wilson, I’m Alex—an AI Sales assistant from Perfect Sprout. This might feel a bit unexpected, but can I share a quick idea that could change how you land your next big client? If it's not useful, let me know, and I won’t bother you again.”)
+- **Permission with Pattern Interrupt**: Ask permission to explain call purpose. Wait for permission before proceeding. (Example: "Hey Wilson, I'm Alex—an AI Sales assistant from Perfect Sprout. This might feel a bit unexpected, but can I share a quick idea that could change how you land your next big client? If it's not useful, let me know, and I won't bother you again.")
 - **Handling Denied Permission**: Offer email information or better call time
 - **AI Disclosure**: Address any surprise about AI naturally and confidently
 
@@ -160,7 +187,7 @@ def prewarm(proc: JobProcess):
 
 
 async def entrypoint(ctx: JobContext):
-    global _default_instructions, outbound_trunk_id,speaking_flag
+    global _default_instructions, outbound_trunk_id, speaking_flag, calls_collection
     #logger.info(f"connecting to room {ctx.room.name}")
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
 
@@ -168,6 +195,39 @@ async def entrypoint(ctx: JobContext):
     # the phone number to dial is provided in the job metadata
     phone_number = ctx.job.metadata
     #logger.info(f"dialing {phone_number} to room {ctx.room.name}")
+
+    # Create a call_id and record call start in MongoDB
+    call_id = str(uuid.uuid4())
+    call_start_time = datetime.now(timezone.utc).isoformat()
+    assistant_id = f"livekit-{ctx.room.name}"
+
+    # Initial call data
+    call_data = {
+        "call_id": call_id,
+        "assistant_id": assistant_id,
+        "type": "outboundPhoneCall",
+        "status": "started",
+        "started_at": call_start_time,
+        "phone_call_provider": "livekit",
+        "customer_phone_number": phone_number,
+        "created_at": call_start_time,
+        "updated_at": call_start_time,
+        "messages": [],
+        "user_id": None,
+        "productID": None,
+        "user_full_name": "",
+        "user_email": "",
+        "recording_url": f"https://storage.example.com/{call_id}-recording.mp3"
+    }
+
+    # Insert initial call data
+    if calls_collection is not None:
+        try:
+            # Run in a thread to avoid blocking
+            await asyncio.to_thread(calls_collection.insert_one, call_data)
+            print(f"Call started: {call_id}")
+        except Exception as e:
+            print(f"Error recording call start to MongoDB: {e}")
 
     # look up the user's phone number and appointment details
     instructions = (
@@ -197,15 +257,6 @@ async def entrypoint(ctx: JobContext):
         text=instructions,
     )
 
-    # agent = VoicePipelineAgent(
-    #     vad=ctx.proc.userdata["vad"],
-    #     stt=deepgram.STT(model="nova-2-phonecall"),
-    #     llm=openai.LLM(),
-    #     tts=openai.TTS(),
-    #     chat_ctx=initial_ctx,
-    #     fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room),
-    # )
-
     agent = VoicePipelineAgent(
         vad=ctx.proc.userdata["vad"],
         stt=deepgram.STT(
@@ -216,10 +267,6 @@ async def entrypoint(ctx: JobContext):
             model="gemini-2.0-flash",
             temperature=0.8
         ),
-        # llm= openai.llm.LLM(
-        #     model="gpt-4o-mini",
-        #     temperature=0.8,
-        # ),
         tts=elevenlabs.tts.TTS(
             model="eleven_flash_v2",
             voice=elevenlabs.tts.Voice(
@@ -246,15 +293,13 @@ async def entrypoint(ctx: JobContext):
         min_endpointing_delay=0.02,
         max_endpointing_delay=0.3,
         preemptive_synthesis=True,
-        fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room),
-        #plotting= True,
-        #turn_detector=turn_detector.EOUModel()
+        fnc_ctx=CallActions(api=ctx.api, participant=participant, room=ctx.room, call_id=call_id),
     )
     # Now, initialize CallActions with the agent object
     agent.start(ctx.room, participant)
 
-
     log_queue = asyncio.Queue()
+    messages_list = []
 
     @agent.on("user_speech_committed")
     def on_user_speech_committed(msg: llm.ChatMessage):
@@ -264,18 +309,118 @@ async def entrypoint(ctx: JobContext):
                 "[image]" if isinstance(x, llm.ChatImage) else x for x in msg
             )
         log_queue.put_nowait(f"[{datetime.now()}] USER:\n{msg.content}\n\n")
+        
+        # Add to messages list for MongoDB
+        messages_list.append({
+            "role": "user",
+            "content": msg.content,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
 
     @agent.on("agent_speech_committed")
     def on_agent_speech_committed(msg: llm.ChatMessage):
         log_queue.put_nowait(f"[{datetime.now()}] AGENT:\n{msg.content}\n\n")
+        
+        # Add to messages list for MongoDB
+        messages_list.append({
+            "role": "assistant",
+            "content": msg.content,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        })
 
     async def write_transcription():
-        async with open("transcriptions.log", "w") as f:
+        # Create transcript directory if it doesn't exist
+        os.makedirs("transcript", exist_ok=True)
+        
+        # Create a filename with timestamp and room name
+        current_date = datetime.now().strftime("%Y%m%d_%H%M%S")
+        json_filename = f"transcript/transcript_{ctx.room.name}_{current_date}.json"
+        
+        # Dictionary to store the conversation history
+        conversation = {
+            "room": ctx.room.name,
+            "timestamp": current_date,
+            "messages": []
+        }
+        
+        try:
+            # Process messages from queue and add to conversation history
             while True:
                 msg = await log_queue.get()
                 if msg is None:
                     break
-                await f.write(msg)
+                
+                # Add to our JSON structure
+                if msg.startswith("["):
+                    # Extract speaker and content
+                    parts = msg.split(":\n", 1)
+                    if len(parts) == 2:
+                        speaker_part = parts[0]
+                        content = parts[1].strip()
+                        
+                        # Get speaker (USER or AGENT)
+                        if "USER" in speaker_part:
+                            speaker = "USER"
+                        else:
+                            speaker = "AGENT"
+                            
+                        # Add to conversation history
+                        conversation["messages"].append({
+                            "speaker": speaker,
+                            "content": content,
+                            "timestamp": datetime.now().isoformat()
+                        })
+            
+            # Save the JSON transcript using aiofiles
+            async with aiofiles.open(json_filename, "w") as json_file:
+                json_content = json.dumps(conversation, indent=2)
+                await json_file.write(json_content)
+                
+            print(f"Transcript for {ctx.room.name} saved to {json_filename}")
+            
+            # Update MongoDB with call end and transcript data
+            if calls_collection is not None and call_id:
+                call_end_time = datetime.now(timezone.utc).isoformat()
+                
+                # Calculate call duration in seconds
+                start_time = datetime.fromisoformat(call_start_time.replace('Z', '+00:00'))
+                end_time = datetime.now(timezone.utc)
+                call_duration = (end_time - start_time).total_seconds()
+                
+                # Create a basic summary
+                summary = f"AI agent made a call to {phone_number}. The call lasted {call_duration:.2f} seconds."
+                
+                # Build full transcript text from messages
+                transcript_text = ""
+                for msg in conversation["messages"]:
+                    transcript_text += f"{msg['speaker']}: {msg['content']}\n"
+                
+                update_data = {
+                    "$set": {
+                        "status": "ended",
+                        "ended_at": call_end_time,
+                        "transcript": transcript_text,
+                        "messages": messages_list,
+                        "call_duration": call_duration,
+                        "ended_reason": "normal-completion",
+                        "summary": summary,
+                        "updated_at": call_end_time
+                    }
+                }
+                
+                try:
+                    # Run MongoDB operation in a thread to avoid blocking
+                    await asyncio.to_thread(
+                        calls_collection.update_one,
+                        {"call_id": call_id},
+                        update_data
+                    )
+                    print(f"Call data updated in MongoDB for call_id: {call_id}")
+                except Exception as e:
+                    print(f"Error updating call data in MongoDB: {e}")
+                
+        except Exception as e:
+            print(f"Error in write_transcription: {e}")
 
     write_task = asyncio.create_task(write_transcription())
 
@@ -292,17 +437,42 @@ class CallActions(llm.FunctionContext):
     """
 
     def __init__(
-        self, *, api: api.LiveKitAPI, participant: rtc.RemoteParticipant, room: rtc.Room
+        self, *, api: api.LiveKitAPI, participant: rtc.RemoteParticipant, room: rtc.Room, call_id: str
     ):
         super().__init__()
 
         self.api = api
         self.participant = participant
         self.room = room
+        self.call_id = call_id
         self.initial_message_played = False  # Flag to ensure message is played once
 
     async def hangup(self):
         try:
+            # Update MongoDB call status to ended
+            if calls_collection is not None and self.call_id:
+                call_end_time = datetime.now(timezone.utc).isoformat()
+                
+                update_data = {
+                    "$set": {
+                        "status": "ended",
+                        "ended_at": call_end_time,
+                        "ended_reason": "customer-ended-call",
+                        "updated_at": call_end_time
+                    }
+                }
+                
+                try:
+                    # Run MongoDB operation in a thread to avoid blocking
+                    await asyncio.to_thread(
+                        calls_collection.update_one,
+                        {"call_id": self.call_id},
+                        update_data
+                    )
+                    print(f"Call marked as ended in MongoDB for call_id: {self.call_id}")
+                except Exception as e:
+                    print(f"Error updating call end status in MongoDB: {e}")
+                    
             await self.api.room.remove_participant(
                 api.RoomParticipantIdentity(
                     room=self.room.name,
@@ -346,11 +516,55 @@ class CallActions(llm.FunctionContext):
         # logger.info(
         #     f"confirming appointment for {self.participant.identity} on {date} at {time}"
         # )
+        
+        # If we have MongoDB connection, store the appointment info
+        if calls_collection is not None and self.call_id:
+            update_data = {
+                "$set": {
+                    "summary": f"Appointment scheduled for {date} at {time}.",
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }
+            }
+            try:
+                # Run MongoDB operation in a thread to avoid blocking
+                await asyncio.to_thread(
+                    calls_collection.update_one,
+                    {"call_id": self.call_id},
+                    update_data
+                )
+                print(f"Appointment information updated in MongoDB for call_id: {self.call_id}")
+            except Exception as e:
+                print(f"Error updating appointment information in MongoDB: {e}")
+                
         return "reservation confirmed"
 
     @llm.ai_callable()
     async def detected_answering_machine(self):
         """Called when the call reaches voicemail. Use this tool AFTER you hear the voicemail greeting"""
+        
+        # Update call status to voicemail in MongoDB
+        if calls_collection is not None and self.call_id:
+            call_end_time = datetime.now(timezone.utc).isoformat()
+            update_data = {
+                "$set": {
+                    "status": "ended",
+                    "ended_at": call_end_time,
+                    "ended_reason": "voicemail-detected",
+                    "summary": "Call reached voicemail",
+                    "updated_at": call_end_time
+                }
+            }
+            try:
+                # Run MongoDB operation in a thread to avoid blocking
+                await asyncio.to_thread(
+                    calls_collection.update_one,
+                    {"call_id": self.call_id},
+                    update_data
+                )
+                print(f"Call marked as voicemail in MongoDB for call_id: {self.call_id}")
+            except Exception as e:
+                print(f"Error updating voicemail status in MongoDB: {e}")
+                
         #logger.info(f"detected answering machine for {self.participant.identity}")
         await self.hangup()
 
