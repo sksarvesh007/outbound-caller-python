@@ -76,7 +76,7 @@ Make cold calls for Perfect Sprout's AI Prospecting services, turn resistance in
 - **Busy**: Schedule a follow-up at a better time
 
 **Call Guidelines**
-
+                         
 1. **Verification and Opening**
 - **Verify**: Confirm speaking with correct person. Wait for confirmation before proceeding.
 - **Permission with Pattern Interrupt**: Ask permission to explain call purpose. Wait for permission before proceeding. (Example: "Hey Wilson, I'm Alex—an AI Sales assistant from Perfect Sprout. This might feel a bit unexpected, but can I share a quick idea that could change how you land your next big client? If it's not useful, let me know, and I won't bother you again.")
@@ -189,17 +189,63 @@ def prewarm(proc: JobProcess):
 async def entrypoint(ctx: JobContext):
     global _default_instructions, outbound_trunk_id, speaking_flag, calls_collection
     #logger.info(f"connecting to room {ctx.room.name}")
-    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
-
-    user_identity = "phone_user"
-    # the phone number to dial is provided in the job metadata
-    phone_number = ctx.job.metadata
-    #logger.info(f"dialing {phone_number} to room {ctx.room.name}")
-
+    
     # Create a call_id and record call start in MongoDB
     call_id = str(uuid.uuid4())
     call_start_time = datetime.now(timezone.utc).isoformat()
     assistant_id = f"livekit-{ctx.room.name}"
+    
+    # Load GCP credentials from credentials.json file
+    gcp_credentials = ""
+    try:
+        with open("credentials.json", "r") as f:
+            gcp_credentials = f.read()
+    except Exception as e:
+        print(f"Error loading GCP credentials: {e}")
+    
+    # Connect to the room
+    await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
+    
+    # Set up recording with GCP bucket storage
+    if gcp_credentials:
+        try:
+            # Organize storage by user_id/call_id
+            user_id = ctx.job.metadata.split(":")[0] if ":" in ctx.job.metadata else "unknown_user"
+            gcp_output_path = f"{user_id}/{call_id}"
+            
+            # Create room composite egress request for audio recording
+            recording_req = api.RoomCompositeEgressRequest(
+                room_name=ctx.room.name,
+                layout="speaker",
+                audio_only=True,
+                segment_outputs=[api.SegmentedFileOutput(
+                    filename_prefix=f"{gcp_output_path}/audio",
+                    playlist_name=f"{gcp_output_path}/playlist.m3u8",
+                    live_playlist_name=f"{gcp_output_path}/live-playlist.m3u8",
+                    segment_duration=5,
+                    gcp=api.GCPUpload(
+                        credentials=gcp_credentials,
+                        bucket=os.getenv("GCP_BUCKET", "outbound-calls-recordings"),
+                    ),
+                )],
+            )
+            
+            # Start the recording
+            recording_res = await ctx.api.egress.start_room_composite_egress(recording_req)
+            
+            # Store recording info in call data
+            recording_url = f"gs://{os.getenv('GCP_BUCKET', 'outbound-calls-recordings')}/{gcp_output_path}/audio.m4a"
+            print(f"Recording started for call {call_id}, URL: {recording_url}")
+        except Exception as e:
+            print(f"Error setting up recording: {e}")
+            recording_url = None
+    else:
+        recording_url = None
+        
+    user_identity = "phone_user"
+    # the phone number to dial is provided in the job metadata
+    phone_number = ctx.job.metadata.split(":")[1] if ":" in ctx.job.metadata else ctx.job.metadata
+    #logger.info(f"dialing {phone_number} to room {ctx.room.name}")
 
     # Initial call data
     call_data = {
@@ -212,6 +258,7 @@ async def entrypoint(ctx: JobContext):
         "customer_phone_number": phone_number,
         "created_at": call_start_time,
         "updated_at": call_start_time,
+        "recording_url": recording_url,
         "messages": []
     }
 
@@ -387,6 +434,14 @@ async def entrypoint(ctx: JobContext):
                 end_time = datetime.now(timezone.utc)
                 call_duration = (end_time - start_time).total_seconds()
                 
+                # Preserve recording URL if it exists
+                try:
+                    call_doc = await asyncio.to_thread(calls_collection.find_one, {"call_id": call_id})
+                    recording_url = call_doc.get("recording_url") if call_doc else None
+                except Exception as e:
+                    print(f"Error retrieving call data: {e}")
+                    recording_url = None
+                
                 update_data = {
                     "$set": {
                         "status": "ended",
@@ -398,6 +453,10 @@ async def entrypoint(ctx: JobContext):
                         "updated_at": call_end_time
                     }
                 }
+                
+                # Add recording URL to update if available
+                if recording_url:
+                    update_data["$set"]["recording_url"] = recording_url
                 
                 try:
                     # Run MongoDB operation in a thread to avoid blocking
@@ -444,6 +503,14 @@ class CallActions(llm.FunctionContext):
             if calls_collection is not None and self.call_id:
                 call_end_time = datetime.now(timezone.utc).isoformat()
                 
+                # Preserve recording URL if it exists
+                try:
+                    call_doc = await asyncio.to_thread(calls_collection.find_one, {"call_id": self.call_id})
+                    recording_url = call_doc.get("recording_url") if call_doc else None
+                except Exception as e:
+                    print(f"Error retrieving call data: {e}")
+                    recording_url = None
+                
                 update_data = {
                     "$set": {
                         "status": "ended",
@@ -452,6 +519,10 @@ class CallActions(llm.FunctionContext):
                         "updated_at": call_end_time
                     }
                 }
+                
+                # Add recording URL to update if available
+                if recording_url:
+                    update_data["$set"]["recording_url"] = recording_url
                 
                 try:
                     # Run MongoDB operation in a thread to avoid blocking
@@ -536,6 +607,15 @@ class CallActions(llm.FunctionContext):
         # Update call status to voicemail in MongoDB
         if calls_collection is not None and self.call_id:
             call_end_time = datetime.now(timezone.utc).isoformat()
+            
+            # Preserve recording URL if it exists
+            try:
+                call_doc = await asyncio.to_thread(calls_collection.find_one, {"call_id": self.call_id})
+                recording_url = call_doc.get("recording_url") if call_doc else None
+            except Exception as e:
+                print(f"Error retrieving call data: {e}")
+                recording_url = None
+                
             update_data = {
                 "$set": {
                     "status": "ended",
@@ -545,6 +625,11 @@ class CallActions(llm.FunctionContext):
                     "updated_at": call_end_time
                 }
             }
+            
+            # Add recording URL to update if available
+            if recording_url:
+                update_data["$set"]["recording_url"] = recording_url
+                
             try:
                 # Run MongoDB operation in a thread to avoid blocking
                 await asyncio.to_thread(
