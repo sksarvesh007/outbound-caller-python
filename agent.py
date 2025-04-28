@@ -195,51 +195,42 @@ async def entrypoint(ctx: JobContext):
     call_start_time = datetime.now(timezone.utc).isoformat()
     assistant_id = f"livekit-{ctx.room.name}"
     
-    # Load GCP credentials from credentials.json file
-    gcp_credentials = ""
-    try:
-        with open("credentials.json", "r") as f:
-            gcp_credentials = f.read()
-    except Exception as e:
-        print(f"Error loading GCP credentials: {e}")
-    
     # Connect to the room
     await ctx.connect(auto_subscribe=AutoSubscribe.AUDIO_ONLY)
     
-    # Set up recording with GCP bucket storage
-    if gcp_credentials:
-        try:
-            # Organize storage by user_id/call_id
-            user_id = ctx.job.metadata.split(":")[0] if ":" in ctx.job.metadata else "unknown_user"
-            gcp_output_path = f"{user_id}/{call_id}"
-            
-            # Create room composite egress request for audio recording
-            recording_req = api.RoomCompositeEgressRequest(
-                room_name=ctx.room.name,
-                layout="speaker",
-                audio_only=True,
-                segment_outputs=[api.SegmentedFileOutput(
-                    filename_prefix=f"{gcp_output_path}/audio",
-                    playlist_name=f"{gcp_output_path}/playlist.m3u8",
-                    live_playlist_name=f"{gcp_output_path}/live-playlist.m3u8",
-                    segment_duration=5,
-                    gcp=api.GCPUpload(
-                        credentials=gcp_credentials,
-                        bucket=os.getenv("GCP_BUCKET", "outbound-calls-recordings"),
-                    ),
-                )],
-            )
-            
-            # Start the recording
-            recording_res = await ctx.api.egress.start_room_composite_egress(recording_req)
-            
-            # Store recording info in call data
-            recording_url = f"gs://{os.getenv('GCP_BUCKET', 'outbound-calls-recordings')}/{gcp_output_path}/audio.m4a"
-            print(f"Recording started for call {call_id}, URL: {recording_url}")
-        except Exception as e:
-            print(f"Error setting up recording: {e}")
-            recording_url = None
-    else:
+    # Set up recording with S3 storage
+    try:
+        # Organize storage by user_id/call_id
+        user_id = ctx.job.metadata.split(":")[0] if ":" in ctx.job.metadata else "unknown_user"
+        s3_output_path = f"{user_id}/{call_id}"
+        
+        # Create room composite egress request for audio recording
+        recording_req = api.RoomCompositeEgressRequest(
+            room_name=ctx.room.name,
+            layout="speaker",
+            audio_only=True,
+            file_outputs=[api.EncodedFileOutput(
+                file_type=api.EncodedFileType.OGG,
+                filepath=f"{s3_output_path}/{call_id}.ogg",
+                s3=api.S3Upload(
+                    bucket=os.getenv("S3_BUCKET_NAME"),
+                    region=os.getenv("S3_REGION"),
+                    access_key=os.getenv("S3_ACCESS_KEY"),
+                    secret=os.getenv("S3_SECRET_KEY"),
+                ),
+            )],
+        )
+        
+        # Start the recording
+        lkapi = api.LiveKitAPI()
+        recording_res = await lkapi.egress.start_room_composite_egress(recording_req)
+        await lkapi.aclose()
+        
+        # Store recording info in call data
+        recording_url = f"s3://{os.getenv('S3_BUCKET_NAME')}/{s3_output_path}/{call_id}.ogg"
+        print(f"Recording started for call {call_id}, URL: {recording_url}")
+    except Exception as e:
+        print(f"Error setting up recording: {e}")
         recording_url = None
         
     user_identity = "phone_user"
